@@ -1,0 +1,1274 @@
+//Muru
+//arduino timer is in millis
+//arduino shall not pass back timer to app, and app's timer overrides arduino timer
+//the pump-valve frequency will be fixed, only changing the pump speed (intensity)
+
+//not done: connect charging state to ESP, and program LED to be orange
+//not done: LED glow for 1 min when running pump
+//not done: LED to replace so wont error
+//muru app BATT REPORT NOT UPDATED ON APP
+
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <EEPROM.h>
+//#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <ADXL345.h>
+#include <VL6180X.h>
+#include "FastLED.h"
+#include "RunningMedian.h"
+#include <microsmooth.h>
+uint16_t *battptr;
+
+RunningMedian samples = RunningMedian(11); //throwback to 101 dalmation :)
+long count = 0;
+
+VL6180X distSensor;
+float checkDistance();
+int lastDistance = 58; //approx calibrated when empty
+int fullDistance = 27; //27mm is the distance of milk surface to the sensor when full container, 
+int VL6180XReadPeriod = 100; //10ms, for 100Hz
+
+//XZ
+BLEServer *pServer = NULL;
+BLECharacteristic * pTxCharacteristic;
+unsigned long lastcheck = 0;
+int connectflag = 0;
+int connectcheck = 0;
+std::string value;
+int batcheck = 0;
+int glow = 0;
+int playing = 0;
+int lastplayed = 0;
+unsigned long previousMillis = 0;        // will store last time LED was updated
+int ledSS = 0;
+
+// constants won't change:
+const long interval = 5000;           // interval at which to blink (milliseconds)
+//END
+
+
+//Low Pass Filter
+// keeps values for each analog pin, assuming a basic arduino that maxes 6 pins. 
+//   you can save a few bytes of memory by putting this on lower-numbered pins and lowering...
+#define LOWPASS_ANALOG_PIN_AMT 1
+ 
+float   lowpass_prev_out[LOWPASS_ANALOG_PIN_AMT], 
+         lowpass_cur_out[LOWPASS_ANALOG_PIN_AMT];
+int        lowpass_input[LOWPASS_ANALOG_PIN_AMT];
+
+
+ADXL345 adxl; //variable adxl is an instance of the ADXL345 library
+
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+//countdown timer
+unsigned long tStim = 1 * 60 * 1000; //stimulation time in milisecond
+unsigned long tExp = 5 * 60 * 1000; //expression time in milisecond
+unsigned long tRun = 0; //running time, can pause
+unsigned long tRunPrev = 0; //prev running time, can pause
+unsigned long secondTick = 1000; //tick every second
+
+//long short press
+const int DEBOUNCE_TIME = 50;
+const int SHORT_PRESS_TIME = 60; // 60 milliseconds
+const int LONG_PRESS_TIME  = 2000; // 2001 milliseconds
+int muru_btn = 19;  // create ezButton object that attach to pin 7; can be flipped. ask client again
+int power_btn = 17;  // create ezButton object that attach to pin 7;
+unsigned long muruPressedTime  = 0;
+unsigned long muruReleasedTime = 0;
+int muruLastState = HIGH;  // the previous state from the input pin
+int muruCurrentState = HIGH;     // the current reading from the input pin
+unsigned long powerPressedTime  = 0;
+unsigned long powerReleasedTime = 0;
+int powerLastState = HIGH;  // the previous state from the input pin
+int powerCurrentState = HIGH;     // the current reading from the input pin
+bool BT_STAT = true;
+
+//WS2812 LED
+//WS2812B LED
+#define DATA_PIN    23
+#define NUM_LEDS    4 
+#define MAX_POWER_MILLIAMPS 100
+#define MAX_BRIGHTNESS 30
+#define LED_TYPE            WS2812
+#define COLOR_ORDER         GRB
+CRGB leds[NUM_LEDS];
+
+//other settings
+int iStim = 0; //stim intensity
+int iExp = 0; //exp intensity
+int vol = 123; //vol of milk measured
+int setIntStim = 0;
+int setDurStim = 0;
+int setIntExp = 0;
+int setDurExp = 0;
+char leftRight;
+
+//pump and valve frequency settings
+unsigned long tPumpOn;                 //Pump on duration in milliseconds
+unsigned long tPumpOff;                //Pump off duration in milliseconds
+unsigned long tValveOn;                //Valve on duration in milliseconds
+unsigned long tValveOff;               //Valve off duration in milliseconds
+int amp;                               //'Power' of pump 0 - 255
+bool on_flag = false;           //True = On, False = Off
+unsigned long t;
+unsigned long tprev;
+
+//Motor Driver
+int AIN1 = 25;
+int AIN2 = 33;
+int PWMA = 32;
+int STBY = 26;
+int BIN1 = 27;
+int BIN2 = 14;
+int PWMB = 12;
+int pumpPWM = 1;
+int valvePWM = 0;
+
+//5V and sleep command
+int en5v = 18;
+
+//battery indicator
+float battV = 0.0;
+bool battLow = false;
+
+//for BLE command
+char cmd;
+int numval;
+
+//for flag
+bool isPlaying = false;
+bool deviceConnected = false;
+
+
+
+//Running average variables
+const int numReadings = 10;
+
+int readings[numReadings];      // the readings from the analog input
+int readIndex = 0;              // the index of the current reading
+int total = 0;                  // the running total
+int average = 0;                // the average
+
+//declare reset fucntion
+void(* resetFunc) (void) = 0;//declare reset function at address 0
+
+//-----------------------------------------------------------------------------------------------------------------------//
+//---class declaration---------------------------------------------------------------------------------------------------//
+//-----------------------------------------------------------------------------------------------------------------------//
+
+class MyServerCallbacks: public BLEServerCallbacks
+{
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("device is Connected");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("device is not Connected");
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pCharacteristic)
+    {
+//      std::string value = pCharacteristic->getValue();
+      value = pCharacteristic->getValue();
+      String input;
+
+      if (value.length() > 0)
+      {
+        char cmd = value[0];
+        String strval;
+        int numval;
+        for (int i = 1; i < value.length(); i++)
+        {
+          strval += value[i];
+        }
+        numval = strval.toInt();
+        Serial.println(cmd);
+        Serial.println(numval);
+
+        if (cmd == 'c') //app asking if device is connected
+        {
+          leds[1] = CRGB::Green;
+          Serial.println("device is connected");
+          connectcheck = 1;
+          pCharacteristic->setValue("c");  //set it to be the value being broadcast
+          tStim = setDurStim;
+          iStim = setIntStim;
+          tExp = setDurExp;
+          iExp = setIntExp;
+
+        }
+        if (cmd == 'L') //app asking if device is connected
+        {
+          leds[1] = CRGB::Black;
+          delay(50);
+          Serial.println("received L");
+          leftRight = 'L';
+          //then turn on left LED and turn off right LED
+          leds[0] = CRGB::Green;
+          leds[1] = CRGB::Green;
+          leds[2] = CRGB::Black;
+          FastLED.show();   // Send the updated pixel colors to the hardware.
+          delay(10);
+        }
+
+        if (cmd == 'R') //app asking if device is connected
+        {
+          leds[1] = CRGB::Black;
+          delay(50);
+          leftRight = 'R';
+          //then turn on right LED, turn off left LED
+          leds[0] = CRGB::Black;
+          leds[1] = CRGB::Green;
+          leds[2] = CRGB::Green;
+          FastLED.show();   // Send the updated pixel colors to the hardware.
+          delay(10);
+        }
+
+        else if (cmd == 'w') //app asking what time
+        {
+          String printDataOut = String(tStim / 1000) + "," + String(tExp / 1000); //prepping a string to send through BLE to phone, sending in seconds
+          std::string dataOut = "";
+          for (int i = 0; i < printDataOut.length(); i++)
+          {
+            dataOut += printDataOut[i];
+          }
+          Serial.println(printDataOut);
+          pCharacteristic->setValue(dataOut);  //set it to be the value being broadcast
+        }
+
+        else if (cmd == 'v') //app asking the milk volume left and right
+        {
+          //leds[1] = CRGB::White;
+          Serial.println("cmd is v");
+          //FastLED.show();
+//          //check the accelerometer data
+//          double xyz[3];
+//          double ax,ay,az;
+//          adxl.getAcceleration(xyz);
+//          ax = xyz[0];
+//          ay = xyz[1];
+//          az = xyz[2];
+//          Serial.print("X=");
+//          Serial.print(ax);
+//            Serial.println(" g");
+//          Serial.print("Y=");
+//          Serial.print(ay);
+//            Serial.println(" g");
+//          Serial.print("Z=");
+//          Serial.print(az);
+//            Serial.println(" g");
+//          Serial.println("**********************");
+
+          //check the distance sensor data
+          Serial.print("distance measured: ");
+          int distRaw = lastDistance;
+          Serial.println(distRaw);
+
+          //convert to volume
+          
+          //semi configured
+          if(distRaw >= 60 ) 
+          {
+            vol = 0; //ml
+          }
+          else if(distRaw > 58)
+          {
+            vol = 10; //ml
+          }
+          else if(distRaw > 57)
+          {
+            vol = 20; //ml
+          }
+          else if(distRaw > 53)
+          {
+            vol = 30; //ml
+          }
+          else if(distRaw > 49)
+          {
+            vol = 40; //ml
+          }
+          else if(distRaw > 43)
+          {
+            vol = 50; //ml
+          }
+          else if(distRaw > 40)
+          {
+            vol = 60; //ml
+          }
+          else if(distRaw > 37)
+          {
+            vol = 70; //ml
+          }
+          else if(distRaw > 34)
+          {
+            vol = 80; //ml
+          }
+          else if(distRaw > 31)
+          {
+            vol = 90; //ml
+          }
+          else if(distRaw <= 27)
+          {
+            vol = 100; //ml
+          }
+          Serial.print("vol = "); Serial.println(vol);
+
+    
+          leds[1] = CRGB::Black;
+          FastLED.show();
+          
+          String printDataOut = String(vol); //prepping a string to send through BLE to phone
+          std::string dataOut = "";
+          for (int i = 0; i < printDataOut.length(); i++)
+          {
+            dataOut += printDataOut[i];
+          }
+          Serial.println(printDataOut);
+          pCharacteristic->setValue(dataOut);  //set it to be the value being broadcast
+
+
+          
+        }
+        else if (cmd == 'i') //app asking the saved intensity
+        {
+          String printDataOut = String(iStim) + "," + String(iExp); //prepping a string to send through BLE to phone, sending the intensity value 1-10
+          std::string dataOut = "";
+          for (int i = 0; i < printDataOut.length(); i++)
+          {
+            dataOut += printDataOut[i];
+          }
+          Serial.println(printDataOut);
+          pCharacteristic->setValue(dataOut);  //set it to be the value being broadcast
+        }
+
+        else if (cmd == 'P') //play button is pressed toggled to play
+        {
+          //glow = 0;
+          isPlaying = true;
+          tRunPrev = millis();
+        }
+        else if (cmd == 'p') //play button is pressed toggled to paused
+        {
+          //glow = 0;
+          isPlaying = false;
+        }
+        else if (cmd == 's') //stimulation intensity setting
+        {
+          iStim = numval;
+          if (EEPROM.read(0) != numval)
+          {
+            EEPROM.write(0, numval); //saving istim to address 0
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 't') //stimulation time setting
+        {
+          tStim = numval * 60 * 1000;
+          if (EEPROM.read(1) != numval)
+          {
+            EEPROM.write(1, numval); //saving tstim to address 1
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'r') //stimulation time -1min
+        {
+          if (tStim >= 1 * 60 * 1000)
+            tStim -= 1 * 60 * 1000;
+          else
+            tStim = 0;
+
+          if (EEPROM.read(1) != tStim / 60 / 1000)
+          {
+            EEPROM.write(1, tStim / 60 / 1000); //saving tstim to address 1
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'u') //stimulation time +1min
+        {
+          tStim += 1 * 60 * 1000;
+          if (EEPROM.read(1) != tStim / 60 / 1000)
+          {
+            EEPROM.write(1, tStim / 60 / 1000); //saving tstim to address 1
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'e') //expression intensity setting
+        {
+          iExp = numval;
+          if (EEPROM.read(2) != numval)
+          {
+            EEPROM.write(2, numval); //saving iexp to address 2
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'f') //expression time setting
+        {
+          tExp = numval * 60 * 1000;
+          if (EEPROM.read(3) != numval)
+          {
+            EEPROM.write(3, numval); //saving texp to address 3
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'd') //expression time -1
+        {
+          if (tExp >= 1 * 60 * 1000)
+            tExp -= 1 * 60 * 1000;
+          else
+            tExp = 0;
+
+          if (EEPROM.read(3) != tExp / 60 / 1000)
+          {
+            EEPROM.write(3, tExp / 60 / 1000); //saving texp to address 3
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'g') //expression time +1
+        {
+          tExp += 1 * 60 * 1000;
+          if (EEPROM.read(3) != tExp / 60 / 1000)
+          {
+            EEPROM.write(3, tExp / 60 / 1000); //saving texp to address 3
+            EEPROM.commit();
+          }
+        }
+        else if (cmd == 'x') //rewind to the setting in flash memory
+        {
+          setIntStim = EEPROM.read(0);
+          setDurStim = EEPROM.read(1);
+          setIntExp = EEPROM.read(2);
+          setDurExp = EEPROM.read(3);
+
+          tStim = setDurStim * 60 * 1000;
+          iStim = setIntStim;
+          tExp = setDurExp * 60 * 1000;
+          iExp = setIntExp;
+
+          Serial.print("Stim Settings = "); Serial.print(iStim); Serial.print(", "); Serial.println(tStim);
+          Serial.print("Exp Settings = "); Serial.print(iExp); Serial.print(", "); Serial.println(tExp);
+        }
+        else if (cmd == 'b') //check battery level and isPlaying status
+        {
+          //Battery volt meter converting 4.2v to 3.3v at battery max
+                   
+          Serial.println(battV);
+
+          String printDataOut = String(battV); //prepping a string to send through BLE to phone
+          std::string dataOut = "";
+          for (int i = 0; i < printDataOut.length(); i++)
+          {
+            dataOut += printDataOut[i];
+          }
+          Serial.println(printDataOut);
+          pCharacteristic->setValue(dataOut);  //set it to be the value being broadcast
+        }
+        else if (cmd == '?') //check isplaying
+        {         
+          String printDataOut;
+          if(isPlaying) printDataOut = "P";
+          else printDataOut = "p";
+          std::string dataOut = "";
+          for (int i = 0; i < printDataOut.length(); i++)
+          {
+            dataOut += printDataOut[i];
+          }
+          Serial.println(printDataOut);
+          pCharacteristic->setValue(dataOut);  //set it to be the value being broadcast
+        }
+      }
+    }
+};
+
+//-----------------------------------------------------------------------------------------------------------------------//
+//---SETUP---------------------------------------------------------------------------------------------------------------//
+//-----------------------------------------------------------------------------------------------------------------------//
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Muru app starts");
+  
+  //5V enable setup
+  pinMode(en5v, OUTPUT);     //5v enable pin
+  digitalWrite(en5v, HIGH);  //enable first
+  //buttons setup
+  pinMode(muru_btn, INPUT_PULLUP);
+  pinMode(power_btn, INPUT_PULLUP);
+  //LED setup
+   //LED Setup
+  FastLED.addLeds<LED_TYPE,DATA_PIN,COLOR_ORDER>(leds, NUM_LEDS).setCorrection( TypicalLEDStrip );
+//  FastLED.setMaxPowerInVoltsAndMilliamps( 5, MAX_POWER_MILLIAMPS);
+  FastLED.setBrightness(MAX_BRIGHTNESS);
+
+  Wire.begin();
+  distSensor.init();
+  delay(100);
+  distSensor.configureDefault();
+  //xz
+  lastcheck = millis();
+  //end
+  // Reduce range max convergence time and ALS integration
+  // time to 30 ms and 50 ms, respectively, to allow 10 Hz
+  // operation (as suggested by Table 6 ("Interleaved mode
+  // limits (10 Hz operation)") in the datasheet).
+  distSensor.writeReg(VL6180X::SYSRANGE__MAX_CONVERGENCE_TIME, 30); //Leo:recommended from datasheet, max convergence rate for 60mm with 17% reflectance is 1.6ms+3.4ms = 5ms exactly
+  distSensor.writeReg16Bit(VL6180X::SYSALS__INTEGRATION_PERIOD, 100); //recommended from datasheet is 100ms
+
+  int timeout = 100; 
+  distSensor.setTimeout(timeout);
+
+   // stop continuous mode if already active
+  distSensor.stopContinuous();
+  // in case stopContinuous() triggered a single-shot
+  // measurement, wait for it to complete
+  delay(300);
+
+  //microsmooth setup
+  battptr = ms_init(SMA);
+  if(battptr == NULL) Serial.println("No memory for microsmooth battery");
+
+  int testRaw = distSensor.readRangeSingleMillimeters();
+  Serial.print("testRaw distance sensor:"); Serial.println(testRaw);
+  if(testRaw >= 255) // meanse distance sensor is not connected
+  {
+    testRaw = distSensor.readRangeSingleMillimeters();
+    Serial.println("Bottle is not detected");
+    leds[0] = CRGB::Black;
+    leds[1] = CRGB::Red;
+    leds[2] = CRGB::Black;
+    leds[3] = CRGB::Red;
+    FastLED.show();
+    delay(500);
+//    while(1)
+    {
+      //stall here, force user to reset with either muru / power button
+      if(digitalRead(power_btn) == LOW || digitalRead(muru_btn) == LOW)
+      {
+        Serial.println("resetting");
+        pTxCharacteristic->setValue("K");
+        pTxCharacteristic->notify();
+        leds[0] = CRGB::Black;
+        leds[1] = CRGB::Black;
+        leds[2] = CRGB::Black;
+        FastLED.show();
+        delay(200);
+        leds[0] = CRGB::Red;
+        leds[1] = CRGB::Red;
+        leds[2] = CRGB::Red;
+        FastLED.show();
+        delay(200);
+        resetFunc(); //reset the fuck out of the device till it detect the distance sensor
+      }
+    }
+  }
+  
+
+  //adxl settings
+  adxlSetup();
+  
+  
+
+  
+
+  //Running average zero the array initialize all the readings to 0:
+  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
+    readings[thisReading] = 0;
+  }
+
+  //BLE setup
+  BLEDevice::init("muru");
+  BLEServer *pServer = BLEDevice::createServer();
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  BLECharacteristic *pCharacteristic = pService->createCharacteristic(
+                                         CHARACTERISTIC_UUID,
+                                         BLECharacteristic::PROPERTY_READ |
+                                         BLECharacteristic::PROPERTY_WRITE
+                                       );
+
+  pCharacteristic->setCallbacks(new MyCallbacks()); //creating callback characteristic(?) to read write
+  //  pCharacteristic->setCallbacks(new MyServerCallbacks()); //creating callback characteristic(?) to check if connected
+
+  pCharacteristic->setValue("Muru");
+  pService->start();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->start();
+
+  // initialize EEPROM with predefined size
+  EEPROM.begin(4);
+  setIntStim = EEPROM.read(0);
+  setDurStim = EEPROM.read(1);
+  setIntExp = EEPROM.read(2);
+  setDurExp = EEPROM.read(3);
+
+  if(EEPROM.read(0) == 255) //means it is not set up yet in the first time programming, set them to the default
+  {
+    EEPROM.write(0, 5); //saving istim to address 0
+    EEPROM.write(1, 5); //saving durstim to address 1
+    EEPROM.write(2, 5); //saving iexp to address 2
+    EEPROM.write(3, 5); //saving durexp to address 3
+    EEPROM.commit(); 
+  }
+
+  tStim = setDurStim * 60 * 1000;
+  iStim = setIntStim;
+  tExp = setDurExp * 60 * 1000;
+  iExp = setIntExp;
+
+  Serial.print("Stim Settings = "); Serial.print(iStim); Serial.print(", "); Serial.println(tStim);
+  Serial.print("Exp Settings = "); Serial.print(iExp); Serial.print(", "); Serial.println(tExp);
+
+
+
+  
+  //LED turn on
+  //turn off LEDs
+  for(int i=0; i<=255; i++)
+  {
+    leds[0] = CRGB(i,i,i);
+    leds[1] = CRGB(i,i,i);
+    leds[2] = CRGB(i,i,i);
+    leds[3] = CRGB(i,i,i);
+    FastLED.show();   // Send the updated pixel colors to the hardware.
+    FastLED.delay(5);
+  }
+  delay(500);
+  FastLED.clear();
+  leds[3] = CRGB::White;
+  FastLED.show();
+  
+  //motor setup
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  
+  digitalWrite(STBY, HIGH);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  //analog is different in esp32: ledcAttachPin(channel#, freq, resolution) usu [0-15channels available],[5000],[8, 8 bit for 0-255]
+  ledcSetup(pumpPWM, 30000, 8);
+  ledcAttachPin(PWMB,pumpPWM);
+
+  ledcSetup(valvePWM,30000,8);
+  ledcAttachPin(PWMA,valvePWM);
+
+  ledcWrite(pumpPWM, 150);
+  Serial.println("pumpON");
+  delay(1000);
+  ledcWrite(pumpPWM, 0);
+  Serial.println("pumpOFF");
+  delay(1000);
+  ledcWrite(valvePWM, 255);
+  delay(1000);
+  ledcWrite(valvePWM, 0);
+
+  leds[1] = CRGB::White;
+  FastLED.show(); 
+}
+
+//-----------------------------------------------------------------------------------------------------------------------//
+//---LOOP----------------------------------------------------------------------------------------------------------------//
+//-----------------------------------------------------------------------------------------------------------------------//
+void loop() {
+  //check for the button
+  checkButtons();
+  
+  //check battery, if button is pressed and batt is low, react by blinking red on Power LED
+  battManagementCheck();
+//  Serial.print(battV);
+
+  if(battLow == true && isPlaying == true)
+  {
+    Serial.println("batt is low, turning the button back off");
+    isPlaying = false;
+    leds[3] = CRGB::Black;
+    FastLED.show();
+    delay(200);
+    leds[3] = CRGB::Red;
+    FastLED.show();
+    delay(200);
+    leds[3] = CRGB::Black;
+    FastLED.show();
+    delay(200);
+    leds[3] = CRGB::Red;
+    FastLED.show();
+  }
+
+
+  //check distance in milk bottle & turn off isPlaying if milk is full
+  lastDistance = distanceMedian();
+//  lastDistance = ema_filter(distSensor.readRangeSingleMillimeters(), VLXptr);
+//  Serial.print(",");
+//  Serial.print(lastDistance);
+//  Serial.println();
+  
+//  Serial.println(distSensor.readRangeSingleMillimeters());
+  if(lastDistance <= fullDistance)
+  {
+    isPlaying = false; //force pause the device
+//    Serial.println("Milk is full");
+    leds[1] = CRGB::Green;
+    FastLED.show();
+    delay(10);                            
+  }
+
+  // put your main code here, to run repeatedly:
+  countdown(isPlaying);
+  freq(tPumpOn, tPumpOff, tValveOn, amp, isPlaying); //the values are adjusted in countdown function
+
+  //turn off pump if isplaying == paused i.e. 0
+  if(isPlaying == false)
+  {
+    ledcWrite(pumpPWM, 0);
+    ledcWrite(valvePWM, 0);
+    if(connectcheck == 1){
+      Serial.println("connected & isplaying == paused ");
+      
+    }else {
+      if(batcheck == 0){   //high power
+        leds[1] = CRGB::White;
+        FastLED.show();
+        
+      }else {
+        Serial.println("not not connected & isplaying == paused ");
+      }
+      
+      
+    }
+    
+  }
+
+  //just to test, uncomment for higher responsivity
+  delay(100);
+
+  //xz
+  if(connectcheck == 1){
+
+
+    if(connectflag == 0){
+      lastcheck = millis();
+      connectflag = 1;   //first time enter the loop       
+    }
+    
+  if(value.length() > 0){
+    lastcheck = millis();
+    value = "";
+  }
+
+  if(millis() - lastcheck > 600000){  //no response for 10 min
+    Serial.println("I start to sleep"); 
+    lastcheck = millis(); 
+    connectflag = 0;  
+    muruLightSleep();
+  }
+  }else connectflag == 0;
+
+}
+
+//-----------------------------------------------------------------------------------------------------------------------//
+//---FUNCTIONS-----------------------------------------------------------------------------------------------------------//
+//-----------------------------------------------------------------------------------------------------------------------//
+
+
+
+void countdown(bool play)
+{
+  if (play)
+  {
+    tRun = millis();
+    if (tRun - tRunPrev > secondTick) //when timer shows 1 second has passed
+    {
+      if (tStim >= 1000) //if there is still time in stimulation
+      {
+        tStim -= 1000; //reduce the stim time by 1 second]
+        //set the pulsing param to pulse according to stimulation
+        
+        tPumpOff = 1000;
+        tValveOn = 300;
+        amp = (int)(8.52*(float)iStim + 169.83) ; //to adjust 1-10 to 0-250 (255 is max) 8.52*K17 + 169.83
+        tPumpOn = (int)(60000.0/(-7.44*(float)iStim + 127.44) - 200); //=(60000/(-7.44*K17 + 127.44)) - 200
+        Serial.print(iStim); Serial.print("\t"); Serial.print(amp); Serial.print("\t"); Serial.println(tPumpOn);
+      }
+
+      else if ((tStim <= 0) && (tExp >= 1000)) // no more time in stim, but there's still time in expression
+      {
+        tStim = 0; //just in case its negative
+        tExp -= 1000; //reduce the exp time by 1 second
+        //start pulsing ala expression, till told otherwise
+        tPumpOn = 5000;
+        tPumpOff = 1000;
+        tValveOn = 300;
+        amp = (int)(8.52*(float)iExp + 169.83) ; //to adjust 1-10 to 0-250 (255 is max) 8.52*K17 + 169.83
+        tPumpOn = (int)(60000/( -4.44*(float)iExp + 74.4) - 300); //=60000/( -4.44*K4 + 74.4) - 300
+        Serial.print(iExp); Serial.print("\t"); Serial.print(amp); Serial.print("\t"); Serial.println(tPumpOn);
+      }
+
+      else if ((tStim <= 0) && (tExp <= 0)) // no more time in stim and expression
+      {
+        tStim = 0; //just in case its negative
+        tExp = 0; //just in case its negative
+        //stop all pump and valve
+        isPlaying = false;
+      }
+
+      tRunPrev = tRun; //set the prev tick to the current run
+    }
+  }
+  else if (!play)
+  {
+    unsigned long currentMillis = millis();
+    Serial.println("not playing");
+    Serial.println(lastplayed);
+    Serial.println(currentMillis);
+    //stop all pump and valve
+    isPlaying = false;
+    if(lastplayed == 1){
+        if(currentMillis - previousMillis >= interval){
+          Serial.println("i am ininininin");
+          previousMillis = currentMillis;
+          if(ledSS == 0){
+            Serial.print("now should be white");
+            ledSS = 1;
+            leds[1] = CRGB::Black;
+            FastLED.show();
+          }else{
+            ledSS = 0;
+            Serial.print("now should be black");
+            leds[1] = CRGB::White;
+            FastLED.show();
+        }
+      } 
+    }
+  }
+}
+
+int tempAmp = 0;
+void freq(long tPumpOn, long tPumpOff, long tValveOn, int amp, bool play)
+{
+  if (play)
+  {
+   
+    lastplayed = 1;
+    playing = 1;
+    //cycle the tprev to last one period
+    t = millis();
+    unsigned long tperiod = (tPumpOn + tPumpOff);
+    if (t - tprev > tperiod)
+    {
+      tprev = t;
+    }
+
+    //first phase: pump on
+    if (t - tprev <= tPumpOn)
+    {
+      if(glow < 240){
+      glow = glow + 80;
+      }else glow = 240;
+      leds[1] = CRGB(glow,glow,glow); //LED pulse On when pump is On
+      FastLED.show();
+      FastLED.delay(20);
+      Serial.print("pump is On, with amp = ");
+      Serial.print(amp);
+      ledcWrite(pumpPWM, amp);
+      tempAmp = amp;
+      Serial.println(", valve is off");
+      ledcWrite(valvePWM, 0);
+    }
+
+    //second phase a: pump off, valve stillOff
+    else if (t - tprev <= tPumpOn + 100) //add 100ms buffer
+    {
+      if(glow > 0){
+      glow = glow - 80;
+      }else glow = 0;
+      //turn pump off, turn valve on
+      leds[1] = CRGB(glow,glow,glow); //LED pulse off when pump is off
+      FastLED.show();
+      FastLED.delay(20);
+      Serial.println("pump is off, vlave is still off");
+      ledcWrite(pumpPWM, 0);
+      ledcWrite(valvePWM, 0);
+    }
+
+    //second phase b: pump off, valve On
+    else if (t - tprev <= tPumpOn + tValveOn)
+    {
+      //turn pump off, turn valve on
+      if(glow > 0){
+      glow = glow - 80;
+      }else glow = 0;;
+      //turn pump off, turn valve on
+      leds[1] = CRGB(glow,glow,glow); //LED pulse off when pump is off      
+      FastLED.show();
+      FastLED.delay(20);
+      Serial.println("pump is off, vlave is On");
+      ledcWrite(pumpPWM, 0);
+      ledcWrite(valvePWM, 150);
+    }
+
+    //third phase: pump off, valve off
+    else if (t - tprev <= tPumpOn + tPumpOff)
+    {
+      if(glow > 0){
+      glow = glow - 80;
+      }else glow = 0;;
+      //turn pump off, turn valve on
+      leds[1] = CRGB(glow,glow,glow); //LED pulse off when pump is off      
+      FastLED.show();      
+      FastLED.delay(20);
+      //keep pump off, turn valve off
+      Serial.println("pump is off, vlave is off");
+      ledcWrite(pumpPWM, 0);
+      ledcWrite(valvePWM, 0);
+    }
+  }
+  else if (!play)
+  {
+    playing = 0;
+    ledcWrite(pumpPWM, 0);
+    ledcWrite(valvePWM, 0);
+    Serial.println("check pumping");
+//    leds[1] = CRGB::Black; //LED pulse off when pump is off
+//    FastLED.show();
+  }
+}
+
+void checkButtons() //sth doesnt work with the muru button short press
+{
+    muruCurrentState = digitalRead(muru_btn);
+  
+    if (muruLastState == HIGH && muruCurrentState == LOW) //button pressed
+      muruPressedTime = millis();
+  
+    else if (muruLastState == LOW && muruCurrentState == HIGH) //button released
+    {
+      muruReleasedTime = millis();
+  
+      long muruPressDuration = muruReleasedTime - muruPressedTime;
+  
+      if ( muruPressDuration > DEBOUNCE_TIME && muruPressDuration < LONG_PRESS_TIME )
+      {
+        Serial.println("A short muru press is detected: toggle play/pause");
+        isPlaying = !isPlaying; 
+      }
+  
+      else if ( muruPressDuration > LONG_PRESS_TIME ) //reset the timer and immediatelly start from the start
+      {
+        Serial.println("A long muru press is detected: reset timer to saved in memory");
+        setIntStim = EEPROM.read(0);
+        setDurStim = EEPROM.read(1);
+        setIntExp = EEPROM.read(2);
+        setDurExp = EEPROM.read(3);
+      
+        tStim = setDurStim * 60 * 1000;
+        iStim = setIntStim;
+        tExp = setDurExp * 60 * 1000;
+        iExp = setIntExp;
+      
+        Serial.print("Stim Settings = "); Serial.print(iStim); Serial.print(", "); Serial.println(tStim);
+        Serial.print("Exp Settings = "); Serial.print(iExp); Serial.print(", "); Serial.println(tExp);
+
+        leds[1] = CRGB::White;
+        FastLED.show();
+        delay(200);
+        leds[1] = CRGB::Black;
+        FastLED.show();
+        delay(200);
+        leds[1] = CRGB::White;
+        FastLED.show();
+        delay(200);
+        leds[1] = CRGB::Black;
+        FastLED.show();
+
+        isPlaying = true; //start again from the top, as per what is saved value
+      }
+    }
+    // save the the last state
+    muruLastState = muruCurrentState;
+  
+    powerCurrentState = digitalRead(power_btn);
+  
+    if (powerLastState == HIGH && powerCurrentState == LOW) //button pressed
+      powerPressedTime = millis();
+  
+    else if (powerLastState == LOW && powerCurrentState == HIGH) //button released
+    {
+      powerReleasedTime = millis();
+  
+      long powerPressDuration = powerReleasedTime - powerPressedTime;
+  
+//      if (powerPressDuration > DEBOUNCE_TIME && powerPressDuration < LONG_PRESS_TIME) //short power press = reset
+//      {
+//        Serial.println("A short powerbtn press is detected: will reset");
+//        leds[3] = CRGB::Red; //red colour
+//        FastLED.show();
+//        delay(1000);
+//        FastLED.clear();
+//        FastLED.show();
+//        resetFunc(); //call reset 
+//      }
+//  
+      if ( powerPressDuration > LONG_PRESS_TIME ) //light sleep: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/sleep_modes.html
+      {
+          Serial.println("A long powerbtn press is detected: device is active, so will turn off everything and go to light sleep mode");          
+          muruLightSleep(); 
+      }
+    }
+    // save the the last state
+    powerLastState = powerCurrentState;
+
+//short press both buttons
+      if(digitalRead(power_btn) == LOW && digitalRead(muru_btn) == LOW)
+      {
+        Serial.println("resetting");
+        pTxCharacteristic->setValue("K");
+        pTxCharacteristic->notify();
+        leds[0] = CRGB::Black;
+        leds[1] = CRGB::Black;
+        leds[2] = CRGB::Black;
+        FastLED.show();
+        delay(200);
+        leds[0] = CRGB::Red;
+        leds[1] = CRGB::Red;
+        leds[2] = CRGB::Red;
+        FastLED.show();
+        delay(200);
+        resetFunc(); 
+      }
+
+
+    
+}
+
+void muruLightSleep() //go to light sleep, that can be woken up by pin 17
+{
+  //turn off LEDs
+  for(int i=255; i>0; i--)
+  {
+    leds[3] = CRGB(i,i,i);
+    FastLED.show();   // Send the updated pixel colors to the hardware.
+    FastLED.delay(3);
+  }
+  for(int i = 0; i<=3; i++)
+  {
+    leds[i] = CRGB::Black;
+  }
+//  digitalWrite(en5v, LOW);  //disable 5V reg to low, but i haven't implemented to turn it back on later, so just leave it for now
+  FastLED.clear();
+  FastLED.show();
+  //turn off everything else, for pump and valve
+  ledcWrite(pumpPWM, 0);
+  ledcWrite(valvePWM, 0);
+  isPlaying = false;
+
+  //set the wakeup through power button
+  esp_sleep_enable_gpio_wakeup();
+  gpio_wakeup_enable(GPIO_NUM_17, GPIO_INTR_LOW_LEVEL);
+  Serial.println("Setting to go to sleep...");
+  delay(100);
+
+  //then go to light sleep
+  esp_light_sleep_start();
+}
+  
+void adxlSetup()
+{
+  adxl.powerOn();
+   //set activity/ inactivity thresholds (0-255)
+  adxl.setActivityThreshold(75); //62.5mg per increment
+  adxl.setInactivityThreshold(75); //62.5mg per increment
+  adxl.setTimeInactivity(10); // how many seconds of no activity is inactive?
+ 
+  //look of activity movement on this axes - 1 == on; 0 == off 
+  adxl.setActivityX(1);
+  adxl.setActivityY(1);
+  adxl.setActivityZ(1);
+ 
+  //look of inactivity movement on this axes - 1 == on; 0 == off
+  adxl.setInactivityX(1);
+  adxl.setInactivityY(1);
+  adxl.setInactivityZ(1);
+ 
+  //look of tap movement on this axes - 1 == on; 0 == off
+  adxl.setTapDetectionOnX(0);
+  adxl.setTapDetectionOnY(0);
+  adxl.setTapDetectionOnZ(1);
+ 
+  //set values for what is a tap, and what is a double tap (0-255)
+  adxl.setTapThreshold(50); //62.5mg per increment
+  adxl.setTapDuration(15); //625us per increment
+  adxl.setDoubleTapLatency(80); //1.25ms per increment
+  adxl.setDoubleTapWindow(200); //1.25ms per increment
+ 
+  //set values for what is considered freefall (0-255)
+  adxl.setFreeFallThreshold(7); //(5 - 9) recommended - 62.5mg per increment
+  adxl.setFreeFallDuration(45); //(20 - 70) recommended - 5ms per increment
+ 
+  //setting all interrupts to take place on int pin 1
+  //I had issues with int pin 2, was unable to reset it
+  adxl.setInterruptMapping( ADXL345_INT_SINGLE_TAP_BIT,   ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_DOUBLE_TAP_BIT,   ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_FREE_FALL_BIT,    ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_ACTIVITY_BIT,     ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_INACTIVITY_BIT,   ADXL345_INT1_PIN );
+ 
+  //register interrupt actions - 1 == on; 0 == off  
+  adxl.setInterrupt( ADXL345_INT_SINGLE_TAP_BIT, 1);
+  adxl.setInterrupt( ADXL345_INT_DOUBLE_TAP_BIT, 1);
+  adxl.setInterrupt( ADXL345_INT_FREE_FALL_BIT,  1);
+  adxl.setInterrupt( ADXL345_INT_ACTIVITY_BIT,   1);
+  adxl.setInterrupt( ADXL345_INT_INACTIVITY_BIT, 1);
+}
+ 
+void battManagementCheck()
+{
+  //Battery volt meter converting 4.2v to 3.3v at battery max
+  int rawRead = analogRead(34);
+//  Serial.print(rawRead);
+//  Serial.print(",");
+  int battRaw;
+  if(rawRead != 0)
+  {
+    battRaw = sma_filter(analogRead(34), battptr);  //not working, maxing out, weird..
+  }
+//  Serial.print("raw batt val:"); Serial.print(battRaw);
+//  Serial.print(" \t ");
+
+  battV = (float(battRaw))/4095.0*4.2;
+
+//  battV = 0.0;
+//  for(int i=0; i<20; i++)
+//  {
+//    battV += (float(battRaw))/4095.0*4.2; //420 is 4.2V
+//  }
+//  battV /= 20;
+  
+//  Serial.println(battV);
+//  
+//  delay(1000);
+  
+  //Charging Status (active low)
+//  float chgStatus = analogRead(34);  //makeshift for now
+//  chgStatus = float(chgStatus) / 4095.0 * 3.3;
+//  Serial.println(chgStatus);
+  //charging status will be handled by the hardware...
+//  if(chgStatus >= 0.8 && chgStatus <= 2) //charging ongoing, that chgStatus is low, but not zero
+//  {
+//    Serial.println("charging ");
+//    pixels.setPixelColor(3, pixels.Color(10, 10, 0));
+//    pixels.show();
+//  }
+//  else 
+  
+  if(battV >= 3.5) // there is charge ready to use, charger is unplugged
+  {
+    batcheck = 0;
+//    Serial.println("Ready to use");
+    leds[3] = CRGB::Green;
+    battLow = false;
+     FastLED.show();
+  }
+  else if(playing == 0 && battV < 3.5) //batt low
+  {
+    batcheck = 1;
+//    Serial.printf("Batt Low: %f", battV);
+    Serial.println("low batt");
+    leds[1] = CRGB::Black;  
+    leds[3] = CRGB::Red;   
+    FastLED.show();
+  }
+//  else if(battV < 3.5) //batt low
+//  {
+//    battLow = true;
+//    leds[3] = CRGB::Red;   
+//    FastLED.show();
+//  }
+
+  
+//  else if(chgStatus >2) //charging is finished, please unplug ..never reached tho..
+//  {
+//    Serial.println("charging is finished, please unplug");
+//    pixels.setPixelColor(3, pixels.Color(0, 10, 10));
+//    pixels.show();
+//  }
+}
+
+float checkDistance() //not used, using low pass filter instead
+{
+  int readRaw = distSensor.readRangeSingleMillimeters();
+//  Serial.print(readRaw);
+//  if (VL6180X.timeoutOccurred()) { Serial.print(" TIMEOUT"); }
+  int readAve = 0;
+  for(int i=0; i<20; i++)
+  {
+    readAve += distSensor.readRangeSingleMillimeters();
+  }
+  readAve /= 20;
+  return readAve;
+}
+
+int adcsample_and_lowpass(int pin, int sample_rate, int samples, float alpha, char use_previous) 
+{
+  // pin:            arduino analog pin number to sample on   (should be < LOWPASS_ANALOG_PIN_AMT)
+  // sample_rate:    approximate rate to sample at (less than ~9000 for default ADC settings)
+  // samples:        how many samples to take in this call  (>1 if you want smoother results)
+  // alpha:          lowpass alpha
+  // use_previous:   If true,  we continue adjusting from the most recent output value.
+  //                 If false, we do one extra analogRead here to prime the value.
+  //   On noisy signals this non-priming value can be misleading, 
+  //     and with few samples per call it may not quite adjust to a realistic value.
+  //   If you want to continue with the value we saw last -- which is most valid when the
+  //     value is not expected to change significantly between calls, you can use true.
+  //   You may still want one initial sampling, possibly in setup(), to start from something real.
+ 
+  float one_minus_alpha = 1.0-alpha;
+  int micro_delay=max(100, (1000000/sample_rate) - (VL6180XReadPeriod*1000)); // minus VL6180XReadPeriod convert ms to us 
+               //(~110us for analogRead at the default ~9ksample/sec,  +50 grasped from thin air (TODO: test)  
+  if (!use_previous) { 
+    //prime with a real value (instead of letting it adjust from the value in the arrays)
+    lowpass_input[pin] = distSensor.readRangeSingleMillimeters();
+    lowpass_prev_out[pin]=lowpass_input[pin]; 
+  }
+ 
+  //Do the amount of samples, and lowpass along the way  
+  int i;
+  for (i=samples;i>0;i--) {
+    delayMicroseconds(micro_delay); 
+    lowpass_input[pin] = distSensor.readRangeSingleMillimeters();
+    lowpass_cur_out[pin] = alpha*lowpass_input[pin] + one_minus_alpha*lowpass_prev_out[pin];
+    lowpass_prev_out[pin]=lowpass_cur_out[pin];
+  }
+  return lowpass_cur_out[pin];
+}
+
+int distanceMedian()
+{
+  count++;
+  long x = distSensor.readRangeSingleMillimeters();
+
+  samples.add(x);
+  float m = samples.getMedian();
+
+//  Serial.println(m);
+
+  return (int)m;
+}
