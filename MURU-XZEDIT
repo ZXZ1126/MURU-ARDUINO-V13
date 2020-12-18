@@ -228,6 +228,7 @@ class MyCallbacks: public BLECharacteristicCallbacks
         {
           leds[1] = CRGB::Black;
           delay(50);
+          Serial.println("received R");
           leftRight = 'R';
           //then turn on right LED, turn off left LED
           leds[0] = CRGB::Black;
